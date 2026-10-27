@@ -41,10 +41,11 @@ from rclpy.action import ActionClient
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from rcl_interfaces.srv import SetParameters
 from std_srvs.srv import SetBool, Trigger, Empty
-from std_msgs.msg import Int8, Bool, Float32, Float64, Int32MultiArray
+from std_msgs.msg import Bool, Float32, Float64, Int32MultiArray
 from geometry_msgs.msg import Point, Pose, PoseArray
 from harvest_interfaces.srv import ApplePrediction, CoordinateToTrajectory, SendTrajectory, RecordTopics, GetGripperPose, SetValue, MoveToPose, SetAppleTarget
 from controller_manager_msgs.srv import SwitchController
+from moveit_msgs.msg import ServoStatus
 from harvest_interfaces.action import EventDetection
 
 # TEMPLATE: action interfaces that don't exist yet, see module docstring.
@@ -100,15 +101,15 @@ def get_data_storage_dir():
 
 
 class ServoStatusCode:
-    """Mirrors moveit_servo::StatusCode (moveit_servo/status_codes.h)."""
-    INVALID = -1
-    NO_WARNING = 0
-    DECELERATE_FOR_APPROACHING_SINGULARITY = 1
-    HALT_FOR_SINGULARITY = 2
-    DECELERATE_FOR_COLLISION = 3
-    HALT_FOR_COLLISION = 4
-    JOINT_BOUND = 5
-    DECELERATE_FOR_LEAVING_SINGULARITY = 6
+    """Mirrors moveit_servo::StatusCode via moveit_msgs/msg/ServoStatus (Jazzy numbering)."""
+    INVALID = ServoStatus.INVALID
+    NO_WARNING = ServoStatus.NO_WARNING
+    DECELERATE_FOR_APPROACHING_SINGULARITY = ServoStatus.DECELERATE_FOR_APPROACHING_SINGULARITY
+    HALT_FOR_SINGULARITY = ServoStatus.HALT_FOR_SINGULARITY
+    DECELERATE_FOR_LEAVING_SINGULARITY = ServoStatus.DECELERATE_FOR_LEAVING_SINGULARITY
+    DECELERATE_FOR_COLLISION = ServoStatus.DECELERATE_FOR_COLLISION
+    HALT_FOR_COLLISION = ServoStatus.HALT_FOR_COLLISION
+    JOINT_BOUND = ServoStatus.JOINT_BOUND
 
 
 class HarvestAborted(Exception):
@@ -253,8 +254,8 @@ class StartHarvestAbort(Node):
 
         # Helper clients
         self.switch_controller_client = self.make_client(SwitchController, '/controller_manager/switch_controller')
-        self.start_servo_client = self.make_client(Trigger, '/servo_node/start_servo')
-        self.configure_servo_cli = self.make_client(SetParameters, '/servo_node/set_parameters')
+        self.pause_servo_client = self.make_client(SetBool, '/servo_node/pause_servo')
+        # self.configure_servo_cli = self.make_client(SetParameters, '/servo_node/set_parameters')
         self.start_move_arm_to_home_client = self.make_client(Trigger, '/move_arm_to_home')
         self.trigger_move_arm_to_config_client = self.make_client(Trigger, 'move_arm_to_config')
         self.coord_to_traj_client = self.make_client(CoordinateToTrajectory, 'coordinate_to_trajectory')
@@ -300,7 +301,7 @@ class StartHarvestAbort(Node):
         self.last_servo_status = ServoStatusCode.NO_WARNING
         servo_status_topic = self.get_parameter('servo_status_topic').get_parameter_value().string_value
         self.servo_status_sub = self.create_subscription(
-            Int8, servo_status_topic, self._servo_status_cb, 10,
+            ServoStatus, servo_status_topic, self._servo_status_cb, 10,
             callback_group=self.status_cb_group,
         )
         # Manual abort service 
@@ -433,12 +434,12 @@ class StartHarvestAbort(Node):
 
     # Abort monitor
     def _servo_status_cb(self, msg):
-        self.last_servo_status = msg.data
+        self.last_servo_status = msg.code
         abort_codes = {ServoStatusCode.HALT_FOR_SINGULARITY, ServoStatusCode.HALT_FOR_COLLISION, ServoStatusCode.JOINT_BOUND}
         if self.abort_on_decelerate:
             abort_codes |= {ServoStatusCode.DECELERATE_FOR_COLLISION, ServoStatusCode.DECELERATE_FOR_APPROACHING_SINGULARITY}
-        if msg.data in abort_codes and not self.abort_event.is_set():
-            self.get_logger().error(f"servo status={msg.data}: aborting current stage")
+        if msg.code in abort_codes and not self.abort_event.is_set():
+            self.get_logger().error(f"servo status={msg.code} ({msg.message}): aborting current stage")
             self.abort_event.set()
 
     def _abort_service_cb(self, request, response):
@@ -529,6 +530,7 @@ class StartHarvestAbort(Node):
         if self.enable_recording:
             self.stop_recording()
 
+        self.pause_servo(pause=True)
         self.switch_controller(servo=False)
 
         if self.abort_recovery_mode == 'freedrive':
@@ -672,18 +674,20 @@ class StartHarvestAbort(Node):
                 if self._motion_depth == 0:
                     self._motion_label = None
 
-    def start_servo(self):
-        future = self.start_servo_client.call_async(Trigger.Request())
+    def pause_servo(self, pause=True):
+        future = self.pause_servo_client.call_async(SetBool.Request(data=pause))
         self._wait_for_future(future)
         return future.result()
 
-    def configure_servo(self, frame):
-        # "base_link" for base frame, "tool0" for tool frame
-        req = SetParameters.Request()
-        new_param_value = ParameterValue(type=ParameterType.PARAMETER_STRING, string_value=frame)
-        req.parameters = [Parameter(name='moveit_servo.robot_link_command_frame', value=new_param_value)]
-        future = self.configure_servo_cli.call_async(req)
-        self._wait_for_future(future)
+    # Disabled for Jazzy: the new moveit_servo has no robot_link_command_frame
+    # parameter; the command frame comes from each twist's header.frame_id.
+    # def configure_servo(self, frame):
+    #     # "base_link" for base frame, "tool0" for tool frame
+    #     req = SetParameters.Request()
+    #     new_param_value = ParameterValue(type=ParameterType.PARAMETER_STRING, string_value=frame)
+    #     req.parameters = [Parameter(name='moveit_servo.robot_link_command_frame', value=new_param_value)]
+    #     future = self.configure_servo_cli.call_async(req)
+    #     self._wait_for_future(future)
 
     # ------------------------------------------------------------------
     # Arm motion helpers
@@ -899,12 +903,15 @@ class StartHarvestAbort(Node):
             if self.enable_recording:
                 self.start_recording(topics, prefix)
                 time.sleep(self.recording_startup_delay)
-
-            self.switch_controller(servo=use_servo)
             if use_servo:
-                self.start_servo()
-            if servo_frame:
-                self.configure_servo(servo_frame)
+                self.switch_controller(servo=use_servo)
+                self.pause_servo(pause=not use_servo)
+            else:
+                self.pause_servo(pause=not use_servo)
+                self.switch_controller(servo=use_servo)
+
+            # if servo_frame:
+            #     self.configure_servo(servo_frame)
             if action_fn:
                 action_fn()
 
@@ -912,7 +919,13 @@ class StartHarvestAbort(Node):
                 self.handle_abort()
                 raise HarvestAborted(stage_name)
 
-            self.switch_controller(servo=not use_servo)
+            if use_servo:
+                self.pause_servo(pause=use_servo)
+                self.switch_controller(servo= not use_servo)
+            else:
+                self.switch_controller(servo= not use_servo)
+                self.pause_servo(pause=use_servo)
+
             if self.enable_recording:
                 self.stop_recording()
 
@@ -941,7 +954,7 @@ class StartHarvestAbort(Node):
             input('Done with approach, hit enter to start pressure servoing and pick controller')
 
             def pick_action():
-                self.configure_servo('tool0')
+                # self.configure_servo('tool0')
                 if self.enable_pressure_servo:
                     self.grasp_controller_action()
                 if self.enable_picking:
@@ -958,9 +971,9 @@ class StartHarvestAbort(Node):
             )
 
             original_pick_pattern = self.PICK_PATTERN
-            self.configure_servo('base_link')
+            # self.configure_servo('base_link')
             def pull_back_action():
-                self.configure_servo('base_link')
+                # self.configure_servo('base_link')
                 if self.enable_picking:
                     self.PICK_PATTERN = 'linear-pull'
                     self.pick_controller_action()
@@ -1106,7 +1119,7 @@ class StartHarvestAbort(Node):
                             self.grasp_controller_action()
                         if self.enable_picking:
                             self.pick_controller_action()
-                        self.configure_servo('tool0')
+                        # self.configure_servo('tool0')
 
                     self.run_stage(
                         self.pressure_servo_and_pick_controller_topics,
@@ -1122,7 +1135,7 @@ class StartHarvestAbort(Node):
                     if self.enable_picking:
                         self.PICK_PATTERN = 'linear-pull'
                         self.pick_controller_action()
-                    self.configure_servo('base_link')
+                    # self.configure_servo('base_link')
 
                 try:
                     self.run_stage(
