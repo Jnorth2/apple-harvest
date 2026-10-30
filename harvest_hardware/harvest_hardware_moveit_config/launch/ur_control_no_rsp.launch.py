@@ -31,11 +31,12 @@
 
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterFile, ParameterValue
-from launch_ros.substitutions import FindPackageShare
+from launch_ros.substitutions import FindPackagePrefix, FindPackageShare
 
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
+    ExecuteProcess,
     IncludeLaunchDescription,
     OpaqueFunction,
     RegisterEventHandler,
@@ -232,28 +233,18 @@ def launch_setup(context, *args, **kwargs):
         ]
     )
 
+    # Jazzy uses the generic ros2_control_node for real and mock hardware. The
+    # controller manager reads robot_description from the topic published by
+    # robot_state_publisher (started by the including launch file).
     control_node = Node(
         package="controller_manager",
         executable="ros2_control_node",
         parameters=[
-            robot_description,
             update_rate_config_file,
+            {"overruns.print_warnings": NotSubstitution(headless_mode)},
             ParameterFile(initial_joint_controllers, allow_substs=True),
         ],
         output="screen",
-        condition=IfCondition(use_fake_hardware),
-    )
-
-    ur_control_node = Node(
-        package="ur_robot_driver",
-        executable="ur_ros2_control_node",
-        parameters=[
-            robot_description,
-            update_rate_config_file,
-            ParameterFile(initial_joint_controllers, allow_substs=True),
-        ],
-        output="screen",
-        condition=UnlessCondition(use_fake_hardware),
     )
 
     dashboard_client_node = IncludeLaunchDescription(
@@ -282,19 +273,25 @@ def launch_setup(context, *args, **kwargs):
         ],
     )
 
-    tool_communication_node = Node(
-        package="ur_robot_driver",
-        condition=IfCondition(use_tool_communication),
-        executable="tool_communication.py",
+    tool_communication_node = ExecuteProcess(
         name="ur_tool_comm",
-        output="screen",
-        parameters=[
-            {
-                "robot_ip": robot_ip,
-                "tcp_port": tool_tcp_port,
-                "device_name": tool_device_name,
-            }
+        condition=IfCondition(use_tool_communication),
+        cmd=[
+            PathJoinSubstitution(
+                [
+                    FindPackagePrefix("ur_client_library"),
+                    "lib",
+                    "ur_client_library",
+                    "tool_communication.py",
+                ]
+            ),
+            robot_ip,
+            "--tcp-port",
+            tool_tcp_port,
+            "--device-name",
+            tool_device_name,
         ],
+        output="screen",
     )
 
     urscript_interface = Node(
@@ -351,8 +348,7 @@ def launch_setup(context, *args, **kwargs):
         output="screen",
         parameters=[
             {
-                "motion_controller_uri": f"/{initial_joint_controller.perform(context)}/follow_joint_trajectory",
-                "until_action_uri": "tool_contact_controller/detect_tool_contact",
+                "motion_controller": initial_joint_controller,
             },
         ],
     )
@@ -427,7 +423,6 @@ def launch_setup(context, *args, **kwargs):
 
     nodes_to_start = [
         control_node,
-        ur_control_node,
         dashboard_client_node,
         robot_state_helper_node,
         tool_communication_node,

@@ -46,6 +46,7 @@ from geometry_msgs.msg import Point, Pose, PoseArray
 from harvest_interfaces.srv import ApplePrediction, CoordinateToTrajectory, SendTrajectory, RecordTopics, GetGripperPose, SetValue, MoveToPose, SetAppleTarget
 from controller_manager_msgs.srv import SwitchController
 from moveit_msgs.msg import ServoStatus
+from moveit_msgs.srv import ServoCommandType
 from harvest_interfaces.action import EventDetection
 
 # TEMPLATE: action interfaces that don't exist yet, see module docstring.
@@ -255,6 +256,7 @@ class StartHarvestAbort(Node):
         # Helper clients
         self.switch_controller_client = self.make_client(SwitchController, '/controller_manager/switch_controller')
         self.pause_servo_client = self.make_client(SetBool, '/servo_node/pause_servo')
+        self.servo_command_type_client = self.make_client(ServoCommandType, '/servo_node/switch_command_type')
         # self.configure_servo_cli = self.make_client(SetParameters, '/servo_node/set_parameters')
         self.start_move_arm_to_home_client = self.make_client(Trigger, '/move_arm_to_home')
         self.trigger_move_arm_to_config_client = self.make_client(Trigger, 'move_arm_to_config')
@@ -675,6 +677,13 @@ class StartHarvestAbort(Node):
                     self._motion_label = None
 
     def pause_servo(self, pause=True):
+        if not pause:
+            # Jazzy moveit_servo drops all input until a command type is set.
+            future = self.servo_command_type_client.call_async(
+                ServoCommandType.Request(command_type=ServoCommandType.Request.TWIST))
+            self._wait_for_future(future)
+            if not (future.result() and future.result().success):
+                self.get_logger().error('Failed to switch MoveIt Servo to TWIST commands')
         future = self.pause_servo_client.call_async(SetBool.Request(data=pause))
         self._wait_for_future(future)
         return future.result()
